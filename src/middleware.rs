@@ -10,7 +10,9 @@ use http::{header, uri::Scheme, HeaderMap, Method, Request, Version};
 use opentelemetry::trace::{TraceContextExt, TraceId};
 use std::{borrow::Cow, net::SocketAddr, time::Duration};
 use tower_http::{
-    classify::{ServerErrorsAsFailures, ServerErrorsFailureClass, SharedClassifier},
+    classify::{
+        GrpcErrorsAsFailures, ServerErrorsAsFailures, ServerErrorsFailureClass, SharedClassifier,
+    },
     trace::{MakeSpan, OnBodyChunk, OnEos, OnFailure, OnRequest, OnResponse, TraceLayer},
 };
 use tracing::{field::Empty, Span};
@@ -85,6 +87,25 @@ pub fn opentelemetry_tracing_layer() -> TraceLayer<
         .on_failure(OtelOnFailure)
 }
 
+/// OpenTelemetry tracing middleware for gRPC.
+pub fn opentelemetry_tracing_layer_grpc() -> TraceLayer<
+    SharedClassifier<GrpcErrorsAsFailures>,
+    OtelMakeGrpcSpan,
+    OtelOnRequest,
+    OtelOnResponse,
+    OtelOnBodyChunk,
+    OtelOnEos,
+    OtelOnFailure,
+> {
+    TraceLayer::new_for_grpc()
+        .make_span_with(OtelMakeGrpcSpan)
+        .on_request(OtelOnRequest)
+        .on_response(OtelOnResponse)
+        .on_body_chunk(OtelOnBodyChunk)
+        .on_eos(OtelOnEos)
+        .on_failure(OtelOnFailure)
+}
+
 /// A [`MakeSpan`] that creates tracing spans using [OpenTelemetry's conventional field names][otel].
 ///
 /// [otel]: https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/semantic_conventions/http.md
@@ -138,6 +159,76 @@ impl<B> MakeSpan<B> for OtelMakeSpan {
         let span = tracing::info_span!(
             "HTTP request",
             otel.name= %name,
+            http.client_ip = %client_ip,
+            http.flavor = %http_flavor(req.version()),
+            http.host = %host,
+            http.method = %http_method_v,
+            http.route = %http_route,
+            http.scheme = %scheme,
+            http.status_code = Empty,
+            http.target = %http_target,
+            http.user_agent = %user_agent,
+            otel.kind = %"server", //opentelemetry::trace::SpanKind::Server
+            otel.status_code = Empty,
+            trace_id = %trace_id,
+        );
+        tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, remote_context);
+        span
+    }
+}
+
+/// A [`MakeSpan`] that creates tracing spans using [OpenTelemetry's conventional field names][otel] for gRPC services.
+///
+/// [otel]: https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/semantic_conventions/http.md
+#[derive(Clone, Copy, Debug)]
+pub struct OtelMakeGrpcSpan;
+
+impl<B> MakeSpan<B> for OtelMakeGrpcSpan {
+    fn make_span(&mut self, req: &Request<B>) -> Span {
+        let user_agent = req
+            .headers()
+            .get(header::USER_AGENT)
+            .map_or("", |h| h.to_str().unwrap_or(""));
+
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .map_or("", |h| h.to_str().unwrap_or(""));
+
+        let scheme = req
+            .uri()
+            .scheme()
+            .map_or_else(|| "HTTP".into(), http_scheme);
+
+        let http_route = req
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or("", |mp| mp.as_str())
+            .to_owned();
+
+        let uri = if let Some(uri) = req.extensions().get::<OriginalUri>() {
+            uri.0.clone()
+        } else {
+            req.uri().clone()
+        };
+        let http_target = uri
+            .path_and_query()
+            .map(|path_and_query| path_and_query.to_string())
+            .unwrap_or_else(|| uri.path().to_owned());
+
+        let client_ip = parse_x_forwarded_for(req.headers())
+            .or_else(|| {
+                req.extensions()
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|ConnectInfo(client_ip)| Cow::from(client_ip.to_string()))
+            })
+            .unwrap_or_default();
+        let http_method_v = http_method(req.method());
+        let (remote_context, trace_id) =
+            create_context_with_trace(extract_remote_context(req.headers()));
+        let span = tracing::info_span!(
+            "",
+            otel.name = %http_target, // Convetion in gRPC tracing.
             http.client_ip = %client_ip,
             http.flavor = %http_flavor(req.version()),
             http.host = %host,
